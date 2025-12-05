@@ -217,25 +217,18 @@ void initializeRF(){
     my_nrf24l01p.enable();
 }
 
-Coordinate parseCoordinate(char* msg) {
-    Coordinate mAxis;
-    char* bytesFloat = msg + 1;
-
-    mAxis.axis = msg[0];
-    std::memcpy(&mAxis.value, bytesFloat, sizeof(mAxis.value));
-
-    return mAxis;    
+void prepareCoordinates(char axis, float value, char* outBuffer)
+{
+    outBuffer[0] = axis;
+    std::memcpy(outBuffer + 1, &value, sizeof(float));
 }
 
-char* prepareCoordinates(char axis, float value) {
-    char strFloat[sizeof(float)];
-    char msg[strlen(strFloat) + strlen(axis)];
-
-    memcpy(strFloat, &value, sizeof(float));
-    strcpy(msg, axis);
-    strcat(msg, strFloat);
-
-    return msg;
+Coordinate parseCoordinate(const char* msg)
+{
+    Coordinate c;
+    c.axis = msg[0];
+    std::memcpy(&c.value, msg + 1, sizeof(float));
+    return c;
 }
 
 /*
