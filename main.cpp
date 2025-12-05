@@ -124,17 +124,7 @@ void motorTurnRight() {
     pc.write(buffer, len);
 }
 
-
-// ---------------------------
-// Obstacle Avoidance
-// ---------------------------
-void handleObstacle(Point final_destination) {
-    len = sprintf(buffer, "Obstáculo detectado! Contornar-lo-ei!\r\n");
-    pc.write(buffer, len);
-
-    motorStop();
-    thread_sleep_for(200);
-
+void contour(Point final_destination) {
     if (final_destination.x > 0){
         motorTurnRight();
         thread_sleep_for(400);
@@ -149,13 +139,89 @@ void handleObstacle(Point final_destination) {
         motorStop();
         thread_sleep_for(500);
     }
+}
+
+
+// ---------------------------
+// Obstacle Avoidance
+// ---------------------------
+void handleObstacle(Point final_destination) {
+    len = sprintf(buffer, "Obstáculo detectado! Contornar-lo-ei!\r\n");
+    pc.write(buffer, len);
+
+    motorStop();
+    thread_sleep_for(200);
+
+    contour(final_destination);
     motorStop();
 
     obstacleDetected = false;
     currentState = stateBeforeObstacle;   // resume previous state
 }
 
+// ---------------------------
+// Main FSM Step
+// ---------------------------
+void runStateMachine() {
 
+    switch (currentState) {
+
+        case State::Initialize:
+            printf("Initializing...\n");
+            motorStop();
+            currentState = State::ReceivePosition;
+            break;
+
+        case State::ReceivePosition:
+            printf("Receiving target position...\n");
+            thread_sleep_for(500);
+            currentState = State::MoveForward;
+            break;
+
+        case State::MoveForward:
+            motorForward();
+            len = sprintf(buffer, "Movendo para frente!\r\n");
+            pc.write(buffer, len);
+            // example condition for turn
+            if (/* some condition */ false) {
+                currentState = State::Turn;
+            }
+            break;
+
+        case State::Turn:
+            len = sprintf(buffer, "Virando!\r\n");
+            pc.write(buffer, len);
+
+            contour(final_destination);
+            motorStop();
+            currentState = State::MoveForward;
+            break;
+    }
+}
+
+
+
+/* main
+// ---------------------------
+// Main
+// ---------------------------
+int main() {
+
+    ultrasonicTicker.attach(&detectObjectISR, 100ms);
+
+    while (true) {
+
+        if (obstacleDetected) {
+            stateBeforeObstacle = currentState;
+            handleObstacle();
+        }
+
+        runStateMachine();
+
+        thread_sleep_for(50);  // small delay
+    }
+}
+*/
 int main() {
     #define TRANSFER_SIZE 4
 
