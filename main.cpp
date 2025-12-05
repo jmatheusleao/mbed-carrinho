@@ -9,6 +9,8 @@
 #define TURN_ON 1
 #define TURN_OFF 0
 
+#define TRANSFER_SIZE 5
+
 // Initialize BufferedSerial object for PC communication
 BufferedSerial pc(USBTX, USBRX, 9600); // USBTX and USBRX are default pins for serial communication
 
@@ -37,7 +39,19 @@ InterruptIn irRight(PTA5);
 struct Point {
         float x;
         float y;
-    };
+};
+
+Point finalDestination;
+Point obstaclePosition;
+Point actualPosition;
+
+struct Coordinate {
+    char axis;
+    float value;
+};
+
+Coordinate xAxis;
+Coordinate yAxis;
 
 enum class State {
     Initialize,
@@ -50,7 +64,6 @@ enum class State {
 volatile bool obstacleDetected = false; // define object can be altered 
 State currentState = State::Initialize;
 State stateBeforeObstacle;
-
 
 // ---------------------------
 // Ultrasonic Measurement
@@ -141,7 +154,6 @@ void contour(Point final_destination) {
     }
 }
 
-
 // ---------------------------
 // Obstacle Avoidance
 // ---------------------------
@@ -159,72 +171,17 @@ void handleObstacle(Point final_destination) {
     currentState = stateBeforeObstacle;   // resume previous state
 }
 
-// ---------------------------
-// Main FSM Step
-// ---------------------------
-void runStateMachine() {
-
-    switch (currentState) {
-
-        case State::Initialize:
-            printf("Initializing...\n");
-            motorStop();
-            currentState = State::ReceivePosition;
-            break;
-
-        case State::ReceivePosition:
-            printf("Receiving target position...\n");
-            thread_sleep_for(500);
-            currentState = State::MoveForward;
-            break;
-
-        case State::MoveForward:
-            motorForward();
-            len = sprintf(buffer, "Movendo para frente!\r\n");
-            pc.write(buffer, len);
-            // example condition for turn
-            if (/* some condition */ false) {
-                currentState = State::Turn;
-            }
-            break;
-
-        case State::Turn:
-            len = sprintf(buffer, "Virando!\r\n");
-            pc.write(buffer, len);
-
-            contour(final_destination);
-            motorStop();
-            currentState = State::MoveForward;
-            break;
+char* receiveMessage(){
+    // Check if data is available in the nRF24L01+
+    if (my_nrf24l01p.readable()) {
+        rxDataCnt = my_nrf24l01p.read(NRF24L01P_PIPE_P0, rxData, sizeof(rxData));
+        pc.write(rxData, rxDataCnt);
     }
+    return rxData;
 }
 
 
-
-/* main
-// ---------------------------
-// Main
-// ---------------------------
-int main() {
-
-    ultrasonicTicker.attach(&detectObjectISR, 100ms);
-
-    while (true) {
-
-        if (obstacleDetected) {
-            stateBeforeObstacle = currentState;
-            handleObstacle();
-        }
-
-        runStateMachine();
-
-        thread_sleep_for(50);  // small delay
-    }
-}
-*/
-int main() {
-    #define TRANSFER_SIZE 4
-
+void initializeRF(){
     char txData[TRANSFER_SIZE] = {0}, rxData[TRANSFER_SIZE] = {0};
     int txDataCnt = 0;
     int rxDataCnt = 0;
@@ -258,7 +215,127 @@ int main() {
     my_nrf24l01p.setReceiveMode();
 
     my_nrf24l01p.enable();
+}
 
+Coordinate parseCoordinate(char* msg) {
+    Coordinate mAxis;
+    char* bytesFloat = msg + 1;
+
+    mAxis.axis = msg[0];
+    std::memcpy(&mAxis.value, bytesFloat, sizeof(mAxis.value));
+
+    return mAxis;    
+}
+
+char* prepareCoordinates(char axis, float value) {
+    char strFloat[sizeof(float)];
+    char msg[strlen(strFloat) + strlen(axis)];
+
+    memcpy(strFloat, &value, sizeof(float));
+    strcpy(msg, axis);
+    strcat(msg, strFloat);
+
+    return msg;
+}
+
+/*
+    char* coor = "x";
+    
+    float f = 2.403893f;
+    char float_str[sizeof(float)];
+    
+    memcpy(float_str, &f, sizeof(float));
+    
+    char buf[strlen(float_str) + strlen(coor)];
+    
+    strcpy(buf, coor);
+    strcat(buf, float_str);
+    
+    std::cout << "Converted String: " << buf << std::endl; // Output: 1
+    
+    
+    float decoded_float;
+    char decoded_coor;
+    
+    // Copy the 4 bytes into the memory location of the float
+    char* bytes = buf + 1; 
+    std::memcpy(&decoded_float, bytes, sizeof(decoded_float));
+    
+    char bytesC = buf[0]; 
+    
+    std::cout << "Decoded cord: " << bytesC << std::endl; // Output: 1
+    std::cout << "Decoded float: " << decoded_float << std::endl; // Output: 1
+    return 0;
+
+*/
+
+// ---------------------------
+// Main FSM Step
+// ---------------------------
+void runStateMachine() {
+
+    switch (currentState) {
+        case State::Initialize:
+            printf("Initializing...\n");
+            initializeRF();
+            motorStop();
+            currentState = State::ReceivePosition;
+            break;
+
+        case State::ReceivePosition:
+            printf("Receiving target position...\n");
+            char *msg;
+            coordinate = msg[0];
+            
+            thread_sleep_for(500);
+            msg = receiveMessage();
+            currentState = State::MoveForward;
+            break;
+
+        case State::MoveForward:
+            motorForward();
+            len = sprintf(buffer, "Movendo para frente!\r\n");
+            pc.write(buffer, len);
+            // example condition for turn
+            if (/* some condition */ false) {
+                currentState = State::Turn;
+            }
+            break;
+
+        case State::Turn:
+            len = sprintf(buffer, "Virando!\r\n");
+            pc.write(buffer, len);
+
+            contour(final_destination);
+            motorStop();
+            currentState = State::MoveForward;
+            break;
+    }
+}
+
+/* main
+// ---------------------------
+// Main
+// ---------------------------
+int main() {
+
+    ultrasonicTicker.attach(&detectObjectISR, 100ms);
+
+    while (true) {
+
+        if (obstacleDetected) {
+            stateBeforeObstacle = currentState;
+            handleObstacle();
+        }
+
+        runStateMachine();
+
+        thread_sleep_for(50);  // small delay
+    }
+}
+*/
+
+int main() {
     while (1) {
         // Check if data is available on the serial interface
         if (pc.readable()) {
@@ -270,43 +347,6 @@ int main() {
             if (txDataCnt >= sizeof(txData)) {
                 my_nrf24l01p.write(NRF24L01P_PIPE_P0, txData, txDataCnt);
                 txDataCnt = 0;
-            }
-        }
-
-        // Check if data is available in the nRF24L01+
-        if (my_nrf24l01p.readable()) {
-            rxDataCnt = my_nrf24l01p.read(NRF24L01P_PIPE_P0, rxData, sizeof(rxData));
-            pc.write(rxData, rxDataCnt);
-            if (rxData[0] == 'l') {
-                IN1 = TURN_ON;
-                IN2 = TURN_OFF;
-                IN3 = TURN_OFF;
-                IN4 = TURN_OFF;
-                len = sprintf(buffer, "Ligando Motor A!\r\n");
-                pc.write(buffer, len);
-            } else if (rxData[0] == 'r') {
-                IN1 = TURN_OFF;
-                IN2 = TURN_OFF;
-                IN3 = TURN_ON;
-                IN4 = TURN_OFF;
-                len = sprintf(buffer, "Ligando Motor B!\r\n");
-                pc.write(buffer, len);
-            } else if (rxData[0] == 'b') {
-                IN1 = TURN_ON;
-                IN2 = TURN_OFF;
-                IN3 = TURN_ON;
-                IN4 = TURN_OFF;
-                myled1 = 0;
-                len = sprintf(buffer, "Ligando Ambos!\r\n");
-                pc.write(buffer, len);
-            } else {
-                IN1 = TURN_OFF;
-                IN2 = TURN_OFF;
-                IN3 = TURN_OFF;
-                IN4 = TURN_OFF;
-                myled1 = !myled1;
-                len = sprintf(buffer, "Nada.\r\n");
-                pc.write(buffer, len);
             }
         }
     }
