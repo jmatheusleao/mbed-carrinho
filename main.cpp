@@ -231,37 +231,6 @@ Coordinate parseCoordinate(const char* msg)
     return c;
 }
 
-/*
-    char* coor = "x";
-    
-    float f = 2.403893f;
-    char float_str[sizeof(float)];
-    
-    memcpy(float_str, &f, sizeof(float));
-    
-    char buf[strlen(float_str) + strlen(coor)];
-    
-    strcpy(buf, coor);
-    strcat(buf, float_str);
-    
-    std::cout << "Converted String: " << buf << std::endl; // Output: 1
-    
-    
-    float decoded_float;
-    char decoded_coor;
-    
-    // Copy the 4 bytes into the memory location of the float
-    char* bytes = buf + 1; 
-    std::memcpy(&decoded_float, bytes, sizeof(decoded_float));
-    
-    char bytesC = buf[0]; 
-    
-    std::cout << "Decoded cord: " << bytesC << std::endl; // Output: 1
-    std::cout << "Decoded float: " << decoded_float << std::endl; // Output: 1
-    return 0;
-
-*/
-
 // ---------------------------
 // Main FSM Step
 // ---------------------------
