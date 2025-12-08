@@ -1,315 +1,484 @@
 #include "mbed.h"
 #include "nRF24L01P.h"
-#include <algorithm>
+#include <cstring>
+#include <cmath>
+#include <cstdarg>
 
-// IN1 -> PTB0
-// IN2 -> PTB1
-// IN3 -> PTB2
-// IN4 -> PTB3
-#define TURN_ON 1
-#define TURN_OFF 0
+// ---------------------------
+// CONFIG / HARDWARE PINS
+// ---------------------------
+// nRF24L01P pins (mosi, miso, sck, csn, ce, irq)
+BufferedSerial pc(USBTX, USBRX, 9600);
 
-#define TRANSFER_SIZE 5
-
-// Initialize BufferedSerial object for PC communication
-BufferedSerial pc(USBTX, USBRX, 9600); // USBTX and USBRX are default pins for serial communication
-
-// nRF24L01+ module setup
 nRF24L01P my_nrf24l01p(PTD2, PTD3, PTC5, PTD0, PTD5, PTA13);    // mosi, miso, sck, csn, ce, irq
 
-// LED indicators
-DigitalOut myled1(LED1);
+#define TRANSFER_SIZE 5
+char txData[TRANSFER_SIZE] = {0};
+int txDataCnt = 0;
 
-// H-Bridge 
+const long long RX_ADDR = 0xE7E7E7E7EA;
+const long long TX_ADDR = 0xE7E7E7E7E9;
+
+// Motor H-bridge (L298N) pins
 DigitalOut IN1(PTB0);
 DigitalOut IN2(PTB1);
 DigitalOut IN3(PTB2);
 DigitalOut IN4(PTB3);
 
-// HC-SR04 Ultrasonic
-DigitalOut trigPin(PTD0);
-DigitalIn echoPin(PTD1);
-Timer echoTimer;
+// Ultrasonic HC-SR04 pins
+DigitalOut trigPin(PTD7);
+InterruptIn echoPin(PTD6);
 
-// HW201 IR speed sensors
-InterruptIn irLeft(PTA4);
-InterruptIn irRight(PTA5);
+// Encoders (IR sensors)
+InterruptIn encRight(PTA4);
+InterruptIn encLeft(PTA5);
 
-// Point position
-struct Point {
-        float x;
-        float y;
-};
+// LED
+DigitalOut myled1(LED1);
 
-Point finalDestination;
-Point obstaclePosition;
-Point actualPosition;
+// ---------------------------
+// STATE & NAV DATA STRUCTURES
+// ---------------------------
+struct Point { float x; float y; }; // coordinates in meters (by convention)
+Point finalDestination = {0.0f, 0.0f};
+Point actualPosition = {0.0f, 0.0f};
 
-struct Coordinate {
-    char axis;
-    float value;
-};
-
-Coordinate xAxis;
-Coordinate yAxis;
-
-enum class State {
-    Initialize,
-    ReceivePosition,
-    MoveForward,
-    Turn
-};
-
-
-volatile bool obstacleDetected = false; // define object can be altered 
+struct Coordinate { char axis; float value; };
+enum class State { Initialize, WaitForCoordinates, ReceivePosition, MoveForward, Idle };
 State currentState = State::Initialize;
-State stateBeforeObstacle;
+State stateBeforeObstacle = State::Initialize;
+
+volatile bool obstacleDetected = false;
+
+// RF receive helpers
+bool haveX = false, haveY = false;
 
 // ---------------------------
-// Ultrasonic Measurement
+// ENCODER VARIABLES & DEBOUNCE
 // ---------------------------
-float measureDistanceCM() {
-    trigPin = 1;
-    wait_us(10);
-    trigPin = 0;
+volatile int32_t pulse_right = 0;
+volatile int32_t pulse_left  = 0;
 
-    while (echoPin.read() == 0);
-    echoTimer.reset();
-    echoTimer.start();
+static const float CM_PER_PULSE_RIGHT = 1.37f; // as provided (cm per encoder pulse)
+static const float CM_PER_PULSE_LEFT  = 1.37f;
 
-    while (echoPin.read() == 1);
-    echoTimer.stop();
+Timer debounceTimer;
+volatile uint32_t last_right_us = 0;
+volatile uint32_t last_left_us  = 0;
+static const uint32_t DEBOUNCE_US = 300;  // microseconds
 
-    float duration = echoTimer.read_us();
-    float distance = duration * 0.0343f / 2.0f;  // cm
-    return distance;
-}
-
-// ---------------------------
-// Obstacle Detection (Async)
-// ---------------------------
-Ticker ultrasonicTicker;
-
-void detectObjectISR() {
-    float d = measureDistanceCM();
-    if (d > 0 && d < 15.0f) {      // 15 cm threshold
-        obstacleDetected = true;
+void on_pulse_right()
+{
+    uint32_t now = debounceTimer.read_us();
+    if ((now - last_right_us) > DEBOUNCE_US) {
+        pulse_right++;
+        last_right_us = now;
     }
 }
 
+void on_pulse_left()
+{
+    uint32_t now = debounceTimer.read_us();
+    if ((now - last_left_us) > DEBOUNCE_US) {
+        pulse_left++;
+        last_left_us = now;
+    }
+}
+
+void float_to_str1(char *out, float v)
+{
+    int32_t scaled = (int32_t)(v * 10.0f + (v >= 0 ? 0.5f : -0.5f));
+    if (scaled < 0) scaled = -scaled;
+
+    int32_t inteiro = scaled / 10;
+    int32_t frac    = scaled % 10;
+
+    snprintf(out, 16, "%ld.%01ld", (long)inteiro, (long)frac);
+}
+
+void resetPulses() {
+    __disable_irq();
+    pulse_right = 0;
+    pulse_left = 0;
+    __enable_irq();
+}
+
+float getAverageDistanceCm() {
+    int32_t pr, pl;
+    __disable_irq();
+    pr = pulse_right;
+    pl = pulse_left;
+    __enable_irq();
+    float dR = pr * CM_PER_PULSE_RIGHT;
+    float dL = pl * CM_PER_PULSE_LEFT;
+    return (dR + dL) / 2.0f;
+}
+
+// ---------------------------
+// HC-SR04 (trigger + echo ISRs)
+// ---------------------------
+Timer usEchoTimer;      // used to timestamp echo edges
+volatile uint32_t echo_start_us = 0;
+volatile uint32_t echo_pulse_us = 0;
+volatile bool new_measure = false;
+
+void echo_rise() {
+    echo_start_us = usEchoTimer.read_us();
+}
+void echo_fall() {
+    uint32_t end_us = usEchoTimer.read_us();
+    // protect against wrap (mbed timers are large; still safe)
+    echo_pulse_us = end_us - echo_start_us;
+    new_measure = true;
+}
+
+void send_trigger_pulse()
+{
+    trigPin = 0;
+    wait_us(2);
+    trigPin = 1;
+    wait_us(10);
+    trigPin = 0;
+}
+
+// ---------------------------
+// nRF24 helpers (Option A receiver)
+// ---------------------------
+char rxBuffer[TRANSFER_SIZE];
+
+void initializeRF(){
+    my_nrf24l01p.setRxAddress(RX_ADDR);
+    my_nrf24l01p.setTxAddress(TX_ADDR);
+
+    pc.write("Powering up the nRF24L01+...\r\n", 31);
+    my_nrf24l01p.powerUp();
+
+    my_nrf24l01p.setTransferSize(TRANSFER_SIZE);
+    my_nrf24l01p.setReceiveMode();
+    my_nrf24l01p.enable();
+
+    pc.write("Waiting for coordinates (send 'x' + float, 'y' + float)...\r\n", 55);
+}
+
+// coordinate parser (5-byte: axis + float)
+Coordinate parseCoordinate(const char* msg)
+{
+    Coordinate c;
+    c.axis = msg[0];
+    memcpy(&c.value, msg + 1, sizeof(float));
+    return c;
+}
+
+void checkRFReceive() {
+    if (my_nrf24l01p.readable()) {
+        char msg[TRANSFER_SIZE];
+        int n = my_nrf24l01p.read(NRF24L01P_PIPE_P0, msg, TRANSFER_SIZE);
+        if (n >= 1) {
+            Coordinate c = parseCoordinate(msg);
+            if (c.axis == 'x' || c.axis == 'X') {
+                finalDestination.x = c.value;
+                haveX = true;
+                char buf[64];
+                int l = snprintf(buf, sizeof(buf), "Received X=%.2f\r\n", c.value);
+                pc.write(buf, l);
+            } else if (c.axis == 'y' || c.axis == 'Y') {
+                finalDestination.y = c.value;
+                haveY = true;
+                char buf[64];
+                int l = snprintf(buf, sizeof(buf), "Received Y=%.2f\r\n", c.value);
+                pc.write(buf, l);
+            } else {
+                char buf[64];
+                int l = snprintf(buf, sizeof(buf), "Unknown axis received: %c\r\n", c.axis);
+                pc.write(buf, l);
+            }
+        }
+    }
+}
+
+// ---------------------------
+// Motor helpers
+// ---------------------------
 void motorStop() {
-    IN1 = TURN_OFF;
-    IN2 = TURN_OFF;
-    IN3 = TURN_OFF;
-    IN4 = TURN_OFF;
-    len = sprintf(buffer, "Motores desligados!\r\n");
-    pc.write(buffer, len);
+    IN1 = 0; IN2 = 0; IN3 = 0; IN4 = 0;
+    pc.write("Motors stopped\r\n", 16);
 }
 
 void motorForward() {
-    // later to pass pwm signal
-    IN1 = TURN_ON;
-    IN2 = TURN_OFF;
-    IN3 = TURN_ON;
-    IN4 = TURN_OFF;
+    // IN1/IN2 control right motor, IN3/IN4 left motor (match your wiring)
+    IN1 = 0; IN2 = 1; IN3 = 1; IN4 = 0;
+    myled1 = 1;
+}
+
+void motorBackward() {
+    IN1 = 1; IN2 = 0; IN3 = 0; IN4 = 1;
     myled1 = 0;
-    len = sprintf(buffer, "Andando para frente!\r\n");
-    pc.write(buffer, len);
 }
 
-void motorTurnLeft() {
-    // later to pass pwm signal
-    IN1 = TURN_ON;
-    IN2 = TURN_OFF;
-    IN3 = TURN_OFF;
-    IN4 = TURN_OFF;
-    len = sprintf(buffer, "Virando para esquerda!\r\n");
-    pc.write(buffer, len);
+void motorTurnLeftTimed(int ms) {
+    // pivot/arc left: right wheel forward, left wheel stopped (simple)
+    IN1 = 0; IN2 = 1; IN3 = 0; IN4 = 0;
+    thread_sleep_for(ms);
+    motorStop();
 }
 
-void motorTurnRight() {
-    // later to pass pwm signal
-    IN1 = TURN_OFF;
-    IN2 = TURN_OFF;
-    IN3 = TURN_ON;
-    IN4 = TURN_OFF;
-    len = sprintf(buffer, "Virando para direita!\r\n");
-    pc.write(buffer, len);
+void motorTurnRightTimed(int ms) {
+    IN1 = 0; IN2 = 0; IN3 = 0; IN4 = 1;
+    thread_sleep_for(ms);
+    motorStop();
 }
 
-void contour(Point final_destination) {
-    if (final_destination.x > 0){
-        motorTurnRight();
-        thread_sleep_for(400);
+// simple contour behavior (keeps your original logic)
+void contour(Point finalDest) {
+    if (finalDest.x > 0) {
+        motorTurnRightTimed(5500);
         motorForward();
-        thread_sleep_for(500);
-    } else if (final_destination.x < 0){
-        motorTurnLeft();
-        thread_sleep_for(400);
+        thread_sleep_for(2000);
+        motorStop();
+    } else if (finalDest.x < 0) {
+        motorTurnLeftTimed(5500);
         motorForward();
-        thread_sleep_for(500);
+        thread_sleep_for(2000);
+        motorStop();
     } else {
         motorStop();
         thread_sleep_for(500);
     }
 }
 
-// ---------------------------
-// Obstacle Avoidance
-// ---------------------------
-void handleObstacle(Point final_destination) {
-    len = sprintf(buffer, "Obstáculo detectado! Contornar-lo-ei!\r\n");
-    pc.write(buffer, len);
-
+void handleObstacle() {
     motorStop();
     thread_sleep_for(200);
-
-    contour(final_destination);
-    motorStop();
-
+    contour(finalDestination);
     obstacleDetected = false;
-    currentState = stateBeforeObstacle;   // resume previous state
-}
-
-char* receiveMessage(){
-    // Check if data is available in the nRF24L01+
-    if (my_nrf24l01p.readable()) {
-        rxDataCnt = my_nrf24l01p.read(NRF24L01P_PIPE_P0, rxData, sizeof(rxData));
-        pc.write(rxData, rxDataCnt);
-    }
-    return rxData;
-}
-
-
-void initializeRF(){
-    char txData[TRANSFER_SIZE] = {0}, rxData[TRANSFER_SIZE] = {0};
-    int txDataCnt = 0;
-    int rxDataCnt = 0;
-
-    const long long RX_ADDR = 0xE7E7E7E7EA;
-    const long long TX_ADDR = 0xE7E7E7E7E9;
-
-    my_nrf24l01p.setRxAddress(RX_ADDR);
-    my_nrf24l01p.setTxAddress(TX_ADDR);
-
-    // Initialize the nRF24L01+ module
-    pc.write("Powering up the nRF24L01+...\r\n", 31);
-    my_nrf24l01p.powerUp();
-
-    // Display the setup of the nRF24L01+ chip
-    char buffer[100];
-    int len = sprintf(buffer, "nRF24L01+ Frequency    : %d MHz\r\n", my_nrf24l01p.getRfFrequency());
-    pc.write(buffer, len);
-    len = sprintf(buffer, "nRF24L01+ Output power : %d dBm\r\n", my_nrf24l01p.getRfOutputPower());
-    pc.write(buffer, len);
-    len = sprintf(buffer, "nRF24L01+ Data Rate    : %d kbps\r\n", my_nrf24l01p.getAirDataRate());
-    pc.write(buffer, len);
-    len = sprintf(buffer, "nRF24L01+ TX Address   : 0x%010llX\r\n", my_nrf24l01p.getTxAddress());
-    pc.write(buffer, len);
-    len = sprintf(buffer, "nRF24L01+ RX Address   : 0x%010llX\r\n", my_nrf24l01p.getRxAddress());
-    pc.write(buffer, len);
-
-    pc.write("Type keys to test transfers:\r\n  (transfers are grouped into 4 characters)\r\n", 69);
-
-    my_nrf24l01p.setTransferSize(TRANSFER_SIZE);
-    my_nrf24l01p.setReceiveMode();
-
-    my_nrf24l01p.enable();
-}
-
-void prepareCoordinates(char axis, float value, char* outBuffer)
-{
-    outBuffer[0] = axis;
-    std::memcpy(outBuffer + 1, &value, sizeof(float));
-}
-
-Coordinate parseCoordinate(const char* msg)
-{
-    Coordinate c;
-    c.axis = msg[0];
-    std::memcpy(&c.value, msg + 1, sizeof(float));
-    return c;
+    currentState = stateBeforeObstacle;
 }
 
 // ---------------------------
-// Main FSM Step
+// NAVIGATION / STATE MACHINE
 // ---------------------------
-void runStateMachine() {
+const int TURN_TIME_MS = 2500;          // calibrate so each is ~90 deg
+const float POSITION_TOLERANCE_CM = 2; // tolerance when reaching target
+int navPhase = 0; // 0 -> move X, 1 -> turn to Y, 2 -> move Y, 3 -> done
 
+// convert pulses->cm helpers (given constants are CM_PER_PULSE)
+float pulsesRightToCm(int32_t p) { return p * CM_PER_PULSE_RIGHT; }
+float pulsesLeftToCm(int32_t p)  { return p * CM_PER_PULSE_LEFT;  }
+
+void runStateMachineStep() {
     switch (currentState) {
         case State::Initialize:
-            printf("Initializing...\n");
+            pc.write("Initializing system...\r\n", 24);
             initializeRF();
+            // attach encoders
+            encRight.mode(PullUp);
+            encLeft.mode(PullUp);
+            encRight.rise(&on_pulse_right);
+            encLeft.rise(&on_pulse_left);
+            // ultrasonic
+            trigPin = 0;
+            echoPin.rise(&echo_rise);
+            echoPin.fall(&echo_fall);
+            usEchoTimer.start();
+            debounceTimer.start();
+            resetPulses();
             motorStop();
-            currentState = State::ReceivePosition;
+            navPhase = 0;
+            haveX = haveY = false;
+            // finalDestination.x = 1;
+            // finalDestination.y = 1;
+            // NEW: go wait for coordinates
+            currentState = State::WaitForCoordinates;
+            break;
+
+        case State::WaitForCoordinates:
+            // wait until at least one coordinate arrives; then go to ReceivePosition
+            if (haveX || haveY) {
+                pc.write("First coordinate received. Waiting for the second...\r\n", 58);
+                currentState = State::ReceivePosition;
+            } 
+            // else just keep waiting; checkRFReceive() is called in main loop
             break;
 
         case State::ReceivePosition:
-            printf("Receiving target position...\n");
-            char *msg;
-            coordinate = msg[0];
-            
-            thread_sleep_for(500);
-            msg = receiveMessage();
-            currentState = State::MoveForward;
+            // Wait until BOTH X and Y are received
+            if (haveX && haveY) {
+                char buf[80];
+                int l = snprintf(buf, sizeof(buf), "Target set: (%.2f, %.2f)\r\n", finalDestination.x, finalDestination.y);
+                pc.write(buf, l);
+                // prepare for navigation
+                resetPulses();
+                actualPosition.x = 0.0f;
+                actualPosition.y = 0.0f;
+                navPhase = 0;
+                currentState = State::MoveForward;
+            }
             break;
 
         case State::MoveForward:
-            motorForward();
-            len = sprintf(buffer, "Movendo para frente!\r\n");
-            pc.write(buffer, len);
-            // example condition for turn
-            if (/* some condition */ false) {
-                currentState = State::Turn;
+            // process new ultrasonic measurement (set by echo ISRs)
+            if (new_measure) {
+                new_measure = false;
+                uint32_t dur = echo_pulse_us; // microseconds
+                float dist_cm = dur * 0.01715f; // sound speed: 343 m/s -> /2 and convert
+                if (dist_cm > 0 && dist_cm < 25.0f) {
+                    obstacleDetected = true;
+                }
+            }
+
+            // handle obstacle immediately
+            if (obstacleDetected) {
+                stateBeforeObstacle = currentState;
+                pc.write("Obstacle detected! Performing contour...\r\n", 40);
+                handleObstacle();
+            }
+
+            if (navPhase == 0) {
+                // move along X: assume starting heading is +X
+                float dx = finalDestination.x - actualPosition.x;
+                if (fabsf(dx) < 1e-3f) {
+                    navPhase = 1;
+                    motorStop();
+                    break;
+                }
+                float targetCm = fabsf(dx) * 100.0f; // expects coordinates in meters -> convert to cm
+                resetPulses();
+                if (dx > 0) {
+                    motorForward();
+                } else {
+                    // turn 180 (two 90s) and go forward
+                    motorTurnLeftTimed(TURN_TIME_MS);
+                    motorTurnLeftTimed(TURN_TIME_MS);
+                    motorForward();
+                }
+
+                // blocking loop but checks obstacleDetected/new_measure and updates serial
+                while (true) {
+                    if (obstacleDetected) {
+                        motorStop();
+                        stateBeforeObstacle = currentState;
+                        return; // back to main loop for obstacle handling
+                    }
+                    // compute distance moved using average pulses
+                    float movedCm = getAverageDistanceCm(); // cm
+                    if (movedCm >= targetCm - POSITION_TOLERANCE_CM) {
+                        motorStop();
+                        // update actual position (meters)
+                        float movedM = movedCm / 100.0f;
+                        if (dx > 0) actualPosition.x += movedM;
+                        else actualPosition.x -= movedM;
+                        break;
+                    }
+                    // also keep processing RF so new coordinates won't be missed (non-critical)
+                    checkRFReceive();
+                    thread_sleep_for(15);
+                }
+                // if we had turned for negative dx, turn back to original heading
+                if (dx < 0) {
+                    motorTurnLeftTimed(TURN_TIME_MS);
+                    motorTurnLeftTimed(TURN_TIME_MS);
+                }
+                navPhase = 1;
+                thread_sleep_for(50);
+            } else if (navPhase == 1) {
+                // face +Y or -Y
+                float dy = finalDestination.y - actualPosition.y;
+                if (fabsf(dy) < 1e-3f) {
+                    navPhase = 3; // nothing to do in Y
+                } else {
+                    if (dy > 0) motorTurnLeftTimed(TURN_TIME_MS); // assumption: left turn -> +Y
+                    else motorTurnRightTimed(TURN_TIME_MS);
+                    navPhase = 2;
+                    resetPulses();
+                    thread_sleep_for(50);
+                }
+            } else if (navPhase == 2) {
+                float dy = finalDestination.y - actualPosition.y;
+                if (fabsf(dy) < 1e-3f) {
+                    navPhase = 3;
+                } else {
+                    float targetCm = fabsf(dy) * 100.0f;
+                    resetPulses();
+                    motorForward();
+                    while (true) {
+                        if (obstacleDetected) {
+                            motorStop();
+                            stateBeforeObstacle = currentState;
+                            return;
+                        }
+                        float movedCm = getAverageDistanceCm();
+                        if (movedCm >= targetCm - POSITION_TOLERANCE_CM) {
+                            motorStop();
+                            float movedM = movedCm / 100.0f;
+                            if (dy > 0) actualPosition.y += movedM;
+                            else actualPosition.y -= movedM;
+                            break;
+                        }
+                        checkRFReceive();
+                        thread_sleep_for(15);
+                    }
+                    navPhase = 3;
+                }
+            } else {
+                // navPhase == 3 -> arrived
+                char buf[80];
+                int l = snprintf(buf, sizeof(buf), "Arrived approx at (%.2f, %.2f)\r\n", actualPosition.x, actualPosition.y);
+                pc.write(buf, l);
+                // clear received flags to accept new target later
+                haveX = haveY = false;
+                currentState = State::Idle;
             }
             break;
 
-        case State::Turn:
-            len = sprintf(buffer, "Virando!\r\n");
-            pc.write(buffer, len);
-
-            contour(final_destination);
-            motorStop();
-            currentState = State::MoveForward;
+        case State::Idle:
+            // wait for next coordinates
+            if (haveX || haveY) {
+                // if one coordinate arrives, go back to ReceivePosition to wait for both
+                currentState = State::ReceivePosition;
+            }
             break;
     }
 }
 
-/* main
 // ---------------------------
-// Main
+// MAIN
 // ---------------------------
 int main() {
+    // small startup messages
+    pc.write("Robot booting...\r\n", 18);
 
-    ultrasonicTicker.attach(&detectObjectISR, 100ms);
+    // set initial motor state
+    IN1 = 0; IN2 = 0; IN3 = 0; IN4 = 0;
+    trigPin = 0;
 
+    // ultrasonic trigger ticker (100 ms)
+    Ticker trigTicker;
+    trigTicker.attach(&send_trigger_pulse, 100ms);
+
+    // set initial state
+    currentState = State::Initialize;
+
+    // loop
     while (true) {
+        // nonblocking: check for RF packets
+        checkRFReceive();
 
-        if (obstacleDetected) {
-            stateBeforeObstacle = currentState;
-            handleObstacle();
-        }
-
-        runStateMachine();
-
-        thread_sleep_for(50);  // small delay
-    }
-}
-*/
-
-int main() {
-    while (1) {
-        // Check if data is available on the serial interface
+        // also allow user to type characters to send via nRF (optional debug)
         if (pc.readable()) {
             char c;
-            pc.read(&c, 1);
-            txData[txDataCnt++] = c;
-
-            // Transmit buffer full
-            if (txDataCnt >= sizeof(txData)) {
-                my_nrf24l01p.write(NRF24L01P_PIPE_P0, txData, txDataCnt);
-                txDataCnt = 0;
+            if (pc.read(&c, 1)) {
+                // accumulate and send if you want (keeps previous feature)
+                txData[txDataCnt++] = c;
+                if (txDataCnt >= (int)sizeof(txData)) {
+                    my_nrf24l01p.write(NRF24L01P_PIPE_P0, txData, txDataCnt);
+                    txDataCnt = 0;
+                }
             }
         }
+
+        // run one state machine step
+        runStateMachineStep();
+
+        ThisThread::sleep_for(20ms);
     }
 }
